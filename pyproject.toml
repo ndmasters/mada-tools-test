@@ -71,7 +71,13 @@ tests = [
     "pytest-asyncio"
 ]
 
-all = ["mada_tools[docs, examples, flux, tests]"]
+benchmark = [
+    "anthropic",
+    "google-genai",
+    "boto3",
+]
+
+all = ["mada_tools[docs, examples, flux, tests, benchmark]"]
 
 [project.scripts]
 mada-tools = "mada_tools.main:main"

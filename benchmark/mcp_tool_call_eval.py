@@ -25,13 +25,14 @@ if str(REPO_SRC) not in sys.path:
     sys.path.insert(0, str(REPO_SRC))
 
 from eval_io import load_models_file, parse_model_level, write_csv, write_csv_row, write_json  # noqa: E402
+from model_clients import ModelClientRegistry  # noqa: E402
 
 from mada_tools.shared.config import get_config_value, load_json_object_config  # noqa: E402
 from mada_tools.shared.env import expand_env_vars  # noqa: E402
 
 if TYPE_CHECKING:
     from mcp.client.session import ClientSession
-    from openai import AsyncOpenAI
+    from model_clients import BaseModelClient
 
 DEFAULT_SYSTEM_PROMPT = """You are testing MCP tool calling.
 For each user prompt, call the single best MCP tool with structured arguments.
@@ -426,7 +427,7 @@ async def connect_server(
     server_config: dict[str, Any],
     stack: AsyncExitStack,
     quiet: bool = False,
-) -> tuple[ClientSession, list[dict[str, Any]]]:
+) -> tuple[ClientSession, list[Any]]:
     client_session_cls, streamablehttp_client = load_mcp_client_dependencies()
 
     url = server_config.get("url")
@@ -442,7 +443,7 @@ async def connect_server(
         await stack.enter_async_context(session)
         await session.initialize()
         tools_result = await session.list_tools()
-        tools = [tool_to_openai_format(tool, server_name) for tool in tools_result.tools]
+        tools = list(tools_result.tools)
         latency_ms = round((time.perf_counter() - started) * 1000)
         progress(f"Connected to '{server_name}' with {len(tools)} tools in {latency_ms}ms.", quiet)
         return session, tools
@@ -459,7 +460,7 @@ async def connect_required_servers(
     fixture: dict[str, Any],
     stack: AsyncExitStack,
     quiet: bool = False,
-) -> dict[str, tuple[ClientSession, list[dict[str, Any]]]]:
+) -> dict[str, tuple[ClientSession, list[Any]]]:
     server_configs = fixture["mcp_servers"]
     tests = fixture["tests"]
     required_servers = sorted({test["server"] for test in tests})
@@ -481,110 +482,23 @@ def usage_dict(usage: Any) -> dict[str, int | None]:
 
 
 async def get_tool_call(
-    client: AsyncOpenAI,
+    client: "BaseModelClient",
     model: str,
-    tools: list[dict[str, Any]],
+    tools: list[Any],
+    server_name: str,
     prompt: str,
     system_prompt: str,
     temperature: float | None,
     capture_raw_response: bool = False,
 ) -> ToolCallResult:
-    started = time.perf_counter()
-    kwargs: dict[str, Any] = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
-        ],
-        "tools": tools,
-        "tool_choice": "auto",
-    }
-    if temperature is not None:
-        kwargs["temperature"] = temperature
-
-    try:
-        response = await client.chat.completions.create(**kwargs)
-    except Exception as e:
-        latency_ms = round((time.perf_counter() - started) * 1000)
-        return ToolCallResult(
-            tool_name=None,
-            tool_arguments=None,
-            tool_arguments_raw=None,
-            assistant_text=None,
-            raw_message=None,
-            raw_tool_calls=[],
-            raw_response=None,
-            usage={"prompt_tokens": None, "completion_tokens": None, "total_tokens": None},
-            latency_ms=latency_ms,
-            error_type="api_error",
-            error=f"{type(e).__name__}: {e}",
-        )
-
-    latency_ms = round((time.perf_counter() - started) * 1000)
-    message = response.choices[0].message
-    raw_message = model_dump(message)
-    raw_response = model_dump(response) if capture_raw_response else None
-    tool_calls = message.tool_calls or []
-    raw_tool_calls = [model_dump(tool_call) for tool_call in tool_calls]
-    if not tool_calls:
-        return ToolCallResult(
-            tool_name=None,
-            tool_arguments=None,
-            tool_arguments_raw=None,
-            assistant_text=message.content,
-            raw_message=raw_message,
-            raw_tool_calls=raw_tool_calls,
-            raw_response=raw_response,
-            usage=usage_dict(response.usage),
-            latency_ms=latency_ms,
-            error_type="no_tool_call",
-            error="model returned no tool call",
-        )
-
-    call = tool_calls[0]
-    tool_arguments_raw = call.function.arguments or "{}"
-    try:
-        arguments = json.loads(tool_arguments_raw)
-    except json.JSONDecodeError as e:
-        return ToolCallResult(
-            tool_name=call.function.name,
-            tool_arguments=None,
-            tool_arguments_raw=tool_arguments_raw,
-            assistant_text=message.content,
-            raw_message=raw_message,
-            raw_tool_calls=raw_tool_calls,
-            raw_response=raw_response,
-            usage=usage_dict(response.usage),
-            latency_ms=latency_ms,
-            error_type="bad_json",
-            error=f"tool arguments are not valid JSON: {e}",
-        )
-
-    if not isinstance(arguments, dict):
-        return ToolCallResult(
-            tool_name=call.function.name,
-            tool_arguments=None,
-            tool_arguments_raw=tool_arguments_raw,
-            assistant_text=message.content,
-            raw_message=raw_message,
-            raw_tool_calls=raw_tool_calls,
-            raw_response=raw_response,
-            usage=usage_dict(response.usage),
-            latency_ms=latency_ms,
-            error_type="bad_json",
-            error="tool arguments JSON must decode to an object",
-        )
-
-    return ToolCallResult(
-        tool_name=call.function.name,
-        tool_arguments=arguments,
-        tool_arguments_raw=tool_arguments_raw,
-        assistant_text=message.content,
-        raw_message=raw_message,
-        raw_tool_calls=raw_tool_calls,
-        raw_response=raw_response,
-        usage=usage_dict(response.usage),
-        latency_ms=latency_ms,
+    return await client.complete_tool_call(
+        model=model,
+        tools=tools,
+        server_name=server_name,
+        prompt=prompt,
+        system_prompt=system_prompt,
+        temperature=temperature,
+        capture_raw_response=capture_raw_response,
     )
 
 
@@ -1144,8 +1058,8 @@ def build_detailed_row(
 
 async def execute_work_item(
     work_item: EvalWorkItem,
-    client: AsyncOpenAI,
-    connected_servers: dict[str, tuple[ClientSession, list[dict[str, Any]]]],
+    model_clients: ModelClientRegistry,
+    connected_servers: dict[str, tuple[ClientSession, list[Any]]],
     system_prompt: str,
     temperature: float | None,
     strict: bool,
@@ -1155,10 +1069,12 @@ async def execute_work_item(
 ) -> CompletedWorkItem:
     async with semaphore:
         _session, tools = connected_servers[work_item.test_case["server"]]
+        client, provider_model = model_clients.client_for_model(work_item.model)
         result = await get_tool_call(
             client=client,
-            model=work_item.model,
+            model=provider_model,
             tools=tools,
+            server_name=work_item.test_case["server"],
             prompt=work_item.prompt["text"],
             system_prompt=system_prompt,
             temperature=temperature,
@@ -1190,8 +1106,8 @@ async def execute_work_item(
 
 async def execute_work_items(
     work_items: list[EvalWorkItem],
-    client: AsyncOpenAI,
-    connected_servers: dict[str, tuple[ClientSession, list[dict[str, Any]]]],
+    model_clients: ModelClientRegistry,
+    connected_servers: dict[str, tuple[ClientSession, list[Any]]],
     system_prompt: str,
     temperature: float | None,
     strict: bool,
@@ -1229,7 +1145,7 @@ async def execute_work_items(
             asyncio.create_task(
                 execute_work_item(
                     work_item=work_item,
-                    client=client,
+                    model_clients=model_clients,
                     connected_servers=connected_servers,
                     system_prompt=system_prompt,
                     temperature=temperature,
@@ -1304,8 +1220,6 @@ def format_tokens(row: dict[str, Any]) -> str:
 
 
 async def run(args: argparse.Namespace) -> int:
-    from openai import AsyncOpenAI
-
     validate_shard_args(args)
     fixture = load_json(args.cases)
     config = load_config(args.config)
@@ -1322,10 +1236,22 @@ async def run(args: argparse.Namespace) -> int:
     )
     if not api_key:
         api_key = "dummy" if base_url.startswith(("http://localhost", "http://127.0.0.1")) else None
-    if not api_key:
-        raise ValueError("API key is required. Pass --api-key or set API_KEY.")
-
-    client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=args.request_timeout)
+    provider_config = config.copy()
+    arg_providers = getattr(args, "providers", None)
+    if isinstance(arg_providers, dict):
+        provider_config["providers"] = arg_providers
+    default_provider = (
+        getattr(args, "default_provider", None)
+        or get_config_value(config, "default_provider", section="model", expand_env=False)
+        or "openai"
+    )
+    model_clients = ModelClientRegistry(
+        default_provider=default_provider,
+        config=provider_config,
+        timeout=args.request_timeout,
+        api_key=api_key,
+        base_url=base_url,
+    )
     summary_fields = summary_fields_for_fixture(fixture)
     total_prompts = total_prompt_count(fixture, args.models, args.num_samples)
     work_items = build_work_items(fixture, args.models, args.num_samples, args.shard_count, args.shard_index)
@@ -1364,7 +1290,7 @@ async def run(args: argparse.Namespace) -> int:
             connected_servers = await connect_required_servers(fixture, stack, args.quiet)
             rows, detailed_rows = await execute_work_items(
                 work_items=work_items,
-                client=client,
+                model_clients=model_clients,
                 connected_servers=connected_servers,
                 system_prompt=system_prompt,
                 temperature=args.temperature,
@@ -1425,6 +1351,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--base-url", help="OpenAI-compatible API base URL")
     parser.add_argument("--api-key", help="OpenAI-compatible API key")
+    parser.add_argument(
+        "--default-provider",
+        choices=["openai", "anthropic", "gemini", "bedrock"],
+        help="Provider for model names without a provider: prefix (default: openai)",
+    )
     parser.add_argument("--system-prompt", help="Override the default system prompt")
     parser.add_argument("--temperature", type=float, help="Optional temperature to pass to the model")
     parser.add_argument("--request-timeout", type=float, default=120.0, help="LLM request timeout in seconds")
@@ -1474,7 +1405,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--capture-raw-response",
         action="store_true",
-        help="Include full raw OpenAI-compatible response objects in --results-json",
+        help="Include full raw provider response objects in --results-json",
     )
     parsed = parser.parse_args()
     if parsed.models is None:

@@ -107,6 +107,23 @@ def optional_string(value: Any, field_name: str) -> str | None:
     return value
 
 
+def optional_string_config(config: dict[str, Any], field_name: str) -> str | None:
+    return optional_string(config.get(field_name), f"model_api.{field_name}")
+
+
+def providers_config(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("Run config field 'model_api.providers' must be an object")
+    for provider, provider_value in value.items():
+        if not isinstance(provider, str) or not provider:
+            raise ValueError("Run config field 'model_api.providers' must use non-empty provider names")
+        if not isinstance(provider_value, dict):
+            raise ValueError(f"Run config field 'model_api.providers.{provider}' must be an object")
+    return value
+
+
 def parse_level(value: str) -> int:
     try:
         return parse_model_level(value)
@@ -202,6 +219,8 @@ def build_eval_args(
         models=models,
         base_url=optional_string(model_api_config.get("base_url"), "model_api.base_url"),
         api_key=optional_string(model_api_config.get("api_key"), "model_api.api_key"),
+        default_provider=optional_string_config(model_api_config, "default_provider"),
+        providers=providers_config(model_api_config.get("providers")),
         system_prompt=optional_string(config.get("system_prompt"), "system_prompt") or DEFAULT_SYSTEM_PROMPT,
         temperature=float_or_none(eval_config.get("temperature")),
         request_timeout=float(eval_config.get("request_timeout", 120.0)),

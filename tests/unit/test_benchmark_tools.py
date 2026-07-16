@@ -26,6 +26,7 @@ def load_benchmark_module(module_name: str, filename: str):
 
 
 eval_io = load_benchmark_module("eval_io", "eval_io.py")
+model_clients = load_benchmark_module("model_clients", "model_clients.py")
 populate_eval_models = load_benchmark_module("populate_eval_models", "populate_eval_models.py")
 mcp_tool_call_eval = load_benchmark_module("mcp_tool_call_eval", "mcp_tool_call_eval.py")
 run_tool_call_eval = load_benchmark_module("run_tool_call_eval", "run_tool_call_eval.py")
@@ -159,6 +160,73 @@ class TestPopulateEvalModels:
         contents = enabled_output.read_text(encoding="utf-8")
         assert "3\tmodel-a\n" in contents
         assert "0\tmodel-b\n" in contents
+
+    def test_extract_gemini_model_ids_filters_generate_content_models(self):
+        payload = {
+            "models": [
+                {"name": "models/gemini-pro", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/embedding", "supportedGenerationMethods": ["embedContent"]},
+            ]
+        }
+
+        assert populate_eval_models.extract_gemini_model_ids(payload) == ["gemini-pro"]
+
+
+# model_clients
+
+
+class TestModelClients:
+    def test_provider_and_model_uses_prefix_when_supported(self):
+        assert model_clients.provider_and_model("anthropic:claude-test", "openai") == ("anthropic", "claude-test")
+        assert model_clients.provider_and_model("bedrock:arn:aws:bedrock:model/test", "openai") == (
+            "bedrock",
+            "arn:aws:bedrock:model/test",
+        )
+
+    def test_provider_and_model_falls_back_for_unprefixed_or_unknown_prefix(self):
+        assert model_clients.provider_and_model("gpt-test", "openai") == ("openai", "gpt-test")
+        assert model_clients.provider_and_model("vendor:model", "openai") == ("openai", "vendor:model")
+
+    def test_tool_formatters_emit_provider_specific_shapes(self):
+        tool = {
+            "name": "submit_job",
+            "description": "Submit a job",
+            "inputSchema": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {"job_name": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        }
+
+        assert model_clients.format_tools("openai", [tool], "slurm")[0]["function"]["name"] == "submit_job"
+        assert model_clients.format_tools("anthropic", [tool], "slurm")[0]["input_schema"]["type"] == "object"
+        assert (
+            model_clients.format_tools("bedrock", [tool], "slurm")[0]["toolSpec"]["inputSchema"]["json"]["type"]
+            == "object"
+        )
+        gemini_schema = model_clients.format_tools("gemini", [tool], "slurm")[0]["parameters"]
+        assert "$schema" not in gemini_schema
+        assert "additionalProperties" not in gemini_schema
+
+    def test_usage_normalization_maps_provider_token_fields(self):
+        assert model_clients.anthropic_usage_dict({"input_tokens": 10, "output_tokens": 3}) == {
+            "prompt_tokens": 10,
+            "completion_tokens": 3,
+            "total_tokens": 13,
+        }
+        assert model_clients.gemini_usage_dict(
+            {"prompt_token_count": 10, "candidates_token_count": 3, "total_token_count": 14}
+        ) == {
+            "prompt_tokens": 10,
+            "completion_tokens": 3,
+            "total_tokens": 14,
+        }
+        assert model_clients.bedrock_usage_dict({"inputTokens": 10, "outputTokens": 3, "totalTokens": 13}) == {
+            "prompt_tokens": 10,
+            "completion_tokens": 3,
+            "total_tokens": 13,
+        }
 
 
 # mcp_tool_call_eval
@@ -929,6 +997,10 @@ class TestRunToolCallEval:
                 "shard_count": 4,
                 "shard_index": 1,
             },
+            "model_api": {
+                "default_provider": "anthropic",
+                "providers": {"anthropic": {"api_key": "test-key"}},
+            },
         }
 
         args = cli_overrides()
@@ -949,6 +1021,8 @@ class TestRunToolCallEval:
         assert eval_args.shard_count == 4
         assert eval_args.shard_index == 1
         assert eval_args.capture_raw_response is True
+        assert eval_args.default_provider == "anthropic"
+        assert eval_args.providers == {"anthropic": {"api_key": "test-key"}}
 
     def test_cli_overrides_replace_config_values(self, tmp_path: Path):
         config_models_file = tmp_path / "models.txt"

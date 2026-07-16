@@ -7,7 +7,9 @@ executing the MCP tool itself.
 
 The script is generic. This guide uses a `generate_parameter_runs` style fixture
 to explain the fixture format and the checked-in Flux fixture for runnable
-benchmark examples.
+benchmark examples. OpenAI-compatible APIs remain the default, and native
+provider formats are supported for Anthropic Claude, Google Gemini, and AWS
+Bedrock-hosted models such as Meta Llama.
 
 ## What It Tests
 
@@ -131,11 +133,20 @@ The repository includes a shared curated model list with benchmark levels:
 benchmark/eval_models.tsv
 ```
 
-Use `benchmark/populate_eval_models.py` to query the OpenAI-compatible `/models`
-endpoint and refresh the discovered snapshot:
+Use `benchmark/populate_eval_models.py` to query a provider model-list endpoint
+and refresh the discovered snapshot. OpenAI-compatible `/models` is the default:
 
 ```bash
 python benchmark/populate_eval_models.py
+```
+
+Native discovery can be selected with `--provider`. Non-OpenAI model IDs are
+prefixed with `provider:` by default so a single model file can mix providers:
+
+```bash
+python benchmark/populate_eval_models.py --provider anthropic
+python benchmark/populate_eval_models.py --provider gemini
+python benchmark/populate_eval_models.py --provider bedrock
 ```
 
 This writes the full discovered model list to:
@@ -278,7 +289,47 @@ and Slurm run configs use similar shapes:
 String values may use `${VAR}` and `${VAR:-default}` environment expansion.
 Missing variables without defaults are errors. API settings can be supplied in
 the run config under `model_api`, or left to the lower-level evaluator's normal
-`API_KEY` / `API_BASE_URL` resolution.
+environment resolution.
+
+Provider-prefixed model names select native provider formats:
+
+```text
+gpt-5-mini
+anthropic:claude-sonnet-4-5
+gemini:gemini-2.5-pro
+bedrock:meta.llama3-1-70b-instruct-v1:0
+```
+
+Unprefixed model names use `model_api.default_provider`, which defaults to
+`openai`. Configure provider credentials under `model_api.providers`:
+
+```json
+{
+  "model_api": {
+    "default_provider": "openai",
+    "base_url": "${API_BASE_URL:-https://livai-api.llnl.gov/v1}",
+    "api_key": "${API_KEY}",
+    "providers": {
+      "anthropic": {
+        "api_key": "${ANTHROPIC_API_KEY}"
+      },
+      "gemini": {
+        "api_key": "${GEMINI_API_KEY}"
+      },
+      "bedrock": {
+        "region_name": "${AWS_REGION:-us-west-2}",
+        "profile_name": "${AWS_PROFILE:-default}"
+      }
+    }
+  }
+}
+```
+
+Install optional native-provider clients with:
+
+```bash
+pip install -e ".[benchmark]"
+```
 
 ### Direct Evaluator Usage
 
@@ -407,8 +458,8 @@ arguments, raw tool argument string, assistant text, raw assistant message, and
 raw tool-call objects. This is the best artifact for inspecting why a model
 failed.
 
-Use `--capture-raw-response` to also include the full OpenAI-compatible API
-response object in `--results-json`:
+Use `--capture-raw-response` to also include the full provider API response
+object in `--results-json`:
 
 ```bash
 python benchmark/mcp_tool_call_eval.py \
